@@ -286,6 +286,10 @@ function buildAndSaveRotationPlan($local, $ext, $jobId, $section, $fromServer, $
 	$totalPlanned = 0;
 	$domainCount = count($domains);
 
+	$eligibleSeedsByDomain = [];
+	$totalCounts = [];
+	$eligibleCounts = [];
+
 	// save each domain's original seeds before rotation
 	for ($i = 0; $i < $domainCount; $i++) {
 		$sourceDomain = $domains[$i];
@@ -310,6 +314,37 @@ function buildAndSaveRotationPlan($local, $ext, $jobId, $section, $fromServer, $
 		}
 		// print_r($eligibleSeeds);
 		echo "Eligible seeds for rotation: " . count($eligibleSeeds) . "\n";
+
+		$eligibleSeedsByDomain[$sourceDomain['domain_id']] = $eligibleSeeds;
+		$totalCounts[$sourceDomain['domain_id']] = count($sourceSeeds);
+		$eligibleCounts[$sourceDomain['domain_id']] = count($eligibleSeeds);
+	}
+
+	// decide which domains are actually allowed to rotate
+	$sendable = checkDomainRotate($domains, $totalCounts, $eligibleCounts);
+
+	for ($i = 0; $i < $domainCount; $i++) {
+		$sourceDomain = $domains[$i];
+		$destinationIndex = ($i + 1) % $domainCount;
+		$destinationDomain = $domains[$destinationIndex];
+		$domainId = $sourceDomain['domain_id'];
+
+		echo "\nRotation: " . $sourceDomain['domain_name'] . " to " . $destinationDomain['domain_name'] . "\n";
+
+		if (!$sendable[$domainId]) {
+			echo "Warning: " . $sourceDomain['domain_name'] . " would end up with zero seeds this round "
+				. "(all " . $totalCounts[$domainId] . " seed(s) eligible, but predecessor domain cannot rotate seed out). "
+				. "Seeds stay in current domain.\n";
+			continue;
+		}
+
+		$eligibleSeeds = $eligibleSeedsByDomain[$domainId];
+		echo "Source seeds found: " . $totalCounts[$domainId] . "\n";
+		echo "Eligible seeds for rotation: " . count($eligibleSeeds) . "\n";
+
+		if (count($eligibleSeeds) === 0) {
+			continue;
+		}
 
 		// get the destination for the source seed email
 		$destinationLists = $destinationDomain['lists'];
@@ -890,5 +925,44 @@ function processJob(array $job) {
 
 	$extConn->close();
 	$conn->close();
+}
+
+function checkDomainRotate(array $domains, array $totalCounts, array $eligibleCounts) {
+	$domainCount = count($domains);
+	$domainIds = array_map(function($d) { return $d['domain_id']; }, $domains);
+
+	$send = [];
+	$fullyEligible = [];
+
+	foreach ($domainIds as $idx => $domainId) {
+		$total = isset($totalCounts[$domainId]) ? $totalCounts[$domainId] : 0;
+		$eligible = isset($eligibleCounts[$domainId]) ? $eligibleCounts[$domainId] : 0;
+
+
+		$send[$domainId] = ($eligible > 0); // eligible rotation seed for destination domain based on log (allow partial, eligible could be lesser than total)
+		$fullyEligible[$domainId] = ($total > 0 && $eligible === $total); // source seed vs destination seed
+	}
+
+	// keep scanning until nothing changes
+	for ($pass = 0; $pass < $domainCount; $pass++) {
+		$changed = false;
+
+		for ($i = 0; $i < $domainCount; $i++) {
+			$domainId = $domainIds[$i];
+			$predecessorId = $domainIds[($i - 1 + $domainCount) % $domainCount];
+
+			// to check current domain able to rotate seed out, predecessor domain also have to be able to rotate seed out to current domain
+			if ($fullyEligible[$domainId] && $send[$domainId] && !$send[$predecessorId]) {
+				$send[$domainId] = false;
+				$changed = true;
+			}
+		}
+
+		if (!$changed) {
+			break;
+		}
+	}
+
+	return $send;
 }
 ?>
