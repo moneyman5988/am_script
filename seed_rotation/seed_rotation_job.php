@@ -5,7 +5,7 @@ require_once __DIR__ . '/../callAPILogAlert.php';
 
 checkDuplicateCron();
 
-$qryJob = "SELECT job_id, pigeon_mail, next_rotation_date, next_section
+$qryJob = "SELECT job_id, group_name, next_rotation_date, next_section
 	FROM seed_rotation_job
 	WHERE is_active = '1' AND next_rotation_date = current_date";
 $jobRes = $conn->query($qryJob);
@@ -43,7 +43,7 @@ foreach ($jobs as $job) {
 	} else {
 		// parent process
 		$children[$pid] = true;
-		echo "[".date('H:i:s')."] Parent: child $pid created for {$job['pigeon_mail']}.\n";
+		echo "[".date('H:i:s')."] Parent: child $pid created for {$job['group_name']}.\n";
 	}
 }
 
@@ -273,8 +273,8 @@ function getTotalSeedByMessageGroups($ext, array $messageGroups) {
 	];
 }
 
-function buildAndSaveRotationPlan($local, $ext, $jobId, $section, $fromServer, $runId, array $messageGroups) {
-	$domains = getRotationDomainsAndLists($ext, $messageGroups);
+function buildAndSaveRotationPlan($local, array $extConnections, $jobId, $section, $runId, array $messageGroupsByServer, array $serverDomain) {
+	// $domains = getRotationDomainsAndLists($ext, $messageGroups);
 
 	/*if (count($domains) < 2) {
 		return [
@@ -284,35 +284,89 @@ function buildAndSaveRotationPlan($local, $ext, $jobId, $section, $fromServer, $
 	}*/
 
 	$totalPlanned = 0;
-	$domainCount = count($domains);
+	$domainCount = count($serverDomain);
+
+	$domainLists = [];
+	foreach ($extConnections as $pigeonMail => $ext) {
+		$domainsOnServer = getRotationDomainsAndLists($ext, $messageGroupsByServer[$pigeonMail]);
+		foreach ($domainsOnServer as $domainInfo) {
+			$domainLists[$pigeonMail][$domainInfo['domain_name']] = $domainInfo;
+		}
+	}
+
+	$eligibleSeedsByDomain = [];
+	$totalCounts = [];
+	$eligibleCounts = [];
 
 	// save each domain's original seeds before rotation
 	for ($i = 0; $i < $domainCount; $i++) {
-		$sourceDomain = $domains[$i];
+		$sourceDomain = $serverDomain[$i];
+		$sourceServer = $sourceDomain['pigeon_mail'];
+		$sourceExt = $extConnections[$sourceServer];
+		$sourceDomainInfo = $domainLists[$sourceServer][$sourceDomain['domain_name']];
+		$domainKey = $sourceServer . '|' . $sourceDomain['domain_name'];
 
 		$destinationIndex = ($i + 1) % $domainCount;
-		$destinationDomain = $domains[$destinationIndex];
+		$destinationDomain = $serverDomain[$destinationIndex];
+		$destinationServer = $destinationDomain['pigeon_mail'];
 
 		echo "\nRotation: " . $sourceDomain['domain_name'] . " to " . $destinationDomain['domain_name'] . "\n";
 
 		// get seed email from the list
-		$sourceSeeds = getSeedsFromDomainLists($ext, $sourceDomain);
+		$sourceSeeds = getSeedsFromDomainLists($sourceExt, $sourceDomainInfo);
 
 		echo "Source seeds found: " . count($sourceSeeds) . "\n";
 
 		$eligibleSeeds = []; // store seed that's eligble to rotate
 		foreach ($sourceSeeds as $seed) {
-			if (canSeedRotateToDomain($local, $jobId, $section, $seed['seed_email'], $fromServer, $destinationDomain['domain_name'])) {
+			if (canSeedRotateToDomain($local, $jobId, $section, $seed['seed_email'], $destinationServer, $destinationDomain['domain_name'])) {
 				$eligibleSeeds[] = $seed;
-			} else {
-				echo "Skip seed " . $seed['seed_email'] . ": destination domain " . $destinationDomain['domain_name'] . " not eligible to rotate.\n";
-			}
+			} 
+			// else {
+			// 	echo "Skip seed " . $seed['seed_email'] . ": destination domain " . $destinationDomain['domain_name'] . " not eligible to rotate.\n";
+			// }
 		}
 		// print_r($eligibleSeeds);
 		echo "Eligible seeds for rotation: " . count($eligibleSeeds) . "\n";
 
+		$eligibleSeedsByDomain[$domainKey] = $eligibleSeeds;
+		$totalCounts[$domainKey] = count($sourceSeeds);
+		$eligibleCounts[$domainKey] = count($eligibleSeeds);
+	}
+
+	// decide which domains are actually allowed to rotate
+	$sendable = checkDomainRotate($serverDomain, $totalCounts, $eligibleCounts);
+
+	for ($i = 0; $i < $domainCount; $i++) {
+		$sourceDomain = $serverDomain[$i];
+		$sourceServer = $sourceDomain['pigeon_mail'];
+		$domainKey = $sourceServer . '|' . $sourceDomain['domain_name'];
+
+		$destinationIndex = ($i + 1) % $domainCount;
+		$destinationDomain = $serverDomain[$destinationIndex];
+		$destinationServer = $destinationDomain['pigeon_mail'];
+		$destinationDomainInfo = $domainLists[$destinationServer][$destinationDomain['domain_name']];
+
+		echo "\nRotation: " . $sourceDomain['domain_name'] . " to " . $destinationDomain['domain_name'] . "\n";
+
+		if ($eligibleCounts[$domainKey] === 0) {
+			echo "Skip: no eligible seed to rotate for " . $sourceDomain['domain_name'] . ".\n";
+			continue;
+		}
+
+		if (!$sendable[$domainKey]) {
+			echo "Warning: " . $sourceDomain['domain_name'] . " would end up with zero seeds this round "
+				. "(all " . $totalCounts[$domainKey] . " seed(s) eligible, but predecessor domain cannot rotate seed out). "
+				. "Seeds stay in current domain.\n";
+			continue;
+		}
+
+		$eligibleSeeds = $eligibleSeedsByDomain[$domainKey];
+		echo "Source seeds found: " . $totalCounts[$domainKey] . "\n";
+		echo "Eligible seeds for rotation: " . count($eligibleSeeds) . "\n";
+
 		// get the destination for the source seed email
-		$destinationLists = $destinationDomain['lists'];
+		$destinationLists = $destinationDomainInfo['lists'];
 
 		echo "Destination lists: " . count($destinationLists) . "\n";
 
@@ -332,7 +386,7 @@ function buildAndSaveRotationPlan($local, $ext, $jobId, $section, $fromServer, $
 			$allocatedSeeds = array_slice($eligibleSeeds, $offset, $limit);
 
 			foreach ($allocatedSeeds as $seed) {
-				insertPlannedSeedMovement($local, $runId, $fromServer, $seed, $destinationDomain, $destinationList);
+				insertPlannedSeedMovement($local, $runId, $sourceServer, $destinationServer, $seed, $destinationDomain, $destinationList);
 				$totalPlanned++;
 			}
 
@@ -428,14 +482,15 @@ function calculateListDistribution($totalSeeds, $totalLists) {
 	return $distribution;
 }
 
-function insertPlannedSeedMovement($local, $runId, $fromServer, array $seed, array $destinationDomain, array $destinationList) {
+function insertPlannedSeedMovement($local, $runId, $fromServer, $toServer, array $seed, array $destinationDomain, array $destinationList) {
 	$runId = (int) $runId;
 
 	$seedId = $seed['seed_id'] !== null ? (int) $seed['seed_id'] : 'NULL';
 	$fromListId = (int) $seed['source_list_id'];
 	$toListId = (int) $destinationList['list_id'];
 
-	$serverEsc = $local->real_escape_string($fromServer); // ver1 from server to to server are same
+	$fromServerEsc = $local->real_escape_string($fromServer);
+	$toServerEsc = $local->real_escape_string($toServer);
 	$seedEmailEsc = $local->real_escape_string($seed['seed_email']);
 	$sourceDomainNameEsc = $local->real_escape_string($seed['source_domain_name']);
 	$sourceListEsc = $local->real_escape_string($seed['source_list_name']);
@@ -462,11 +517,11 @@ function insertPlannedSeedMovement($local, $runId, $fromServer, array $seed, arr
 				$runId,
 				'$seedEmailEsc',
 				$seedId,
-				'$serverEsc',
+				'$fromServerEsc',
 				'$sourceDomainNameEsc',
 				'$sourceListEsc',
 				$fromListId,
-				'$serverEsc',
+				'$toServerEsc',
 				'$destinationDomainNameEsc',
 				'$destinationListEsc',
 				$toListId,
@@ -481,10 +536,10 @@ function insertPlannedSeedMovement($local, $runId, $fromServer, array $seed, arr
 	return $local->insert_id;
 }
 
-function executePlannedRotation($local, $ext, $runId) {
+function executePlannedRotation($local, array $extConnections, $runId) {
 	$runId = (int) $runId;
 
-	$sql = "SELECT log_id, seed_id, seed_email, from_list_id, from_list, to_list_id, to_list
+	$sql = "SELECT log_id, seed_id, seed_email, from_server, from_list_id, from_list, to_server, to_list_id, to_list
 			FROM seed_rotation_log
 			WHERE run_id = $runId
 			AND movement_status = 'PLANNED'
@@ -506,8 +561,11 @@ function executePlannedRotation($local, $ext, $runId) {
 			continue;
 		}
 
+		$sourceExt = $extConnections[$movement['from_server']];
+		$destinationExt = $extConnections[$movement['to_server']];
+
 		// insert to destination (to_list)
-		$insertResult = insertPlannedSeedToDestination($ext, $movement);
+		$insertResult = insertPlannedSeedToDestination($destinationExt, $movement);
 
 		if (!$insertResult['success']) {
 			updateMovementStatus($local, $movement['log_id'], 'INSERT_FAILED', $insertResult['error']);
@@ -516,7 +574,7 @@ function executePlannedRotation($local, $ext, $runId) {
 		}
 
 		// delete from source (from_list)
-		$deleteResult = deletePlannedSeedFromSource($ext, $movement);
+		$deleteResult = deletePlannedSeedFromSource($sourceExt, $movement);
 
 		if (!$deleteResult['success']) {
 			updateMovementStatus($local, $movement['log_id'], 'DELETE_FAILED', $deleteResult['error']);
@@ -527,8 +585,52 @@ function executePlannedRotation($local, $ext, $runId) {
 		// update rotation log
 		completeMovement($local, $movement['log_id']);
 
+		$isCrossServer = ($movement['from_server'] !== $movement['to_server']);
+		$destinationSeedId = $movement['seed_id']; // same-server use the existing seed_id
+
+		if ($isCrossServer) {
+			// echo "rotate cross server: {$movement['seed_id']}\n";
+			$sourceSeedInfo = getSeedInfoById($sourceExt, $movement['seed_id']);
+
+			if ($sourceSeedInfo === null) {
+				logAllocateError($local, $movement['log_id'], 'Seed not found in source seed_info during cross-server move');
+			} else {
+				$seedInfoInsertResult = insertSeedInfoToDestination($destinationExt, $sourceSeedInfo, $movement['to_server']);
+
+				if (!$seedInfoInsertResult['success']) {
+					logAllocateError($local, $movement['log_id'], 'Failed to insert seed_info on destination: ' . $seedInfoInsertResult['error']);
+				} else {
+					$seedInfoDeleteResult = deleteSeedInfoFromSource($sourceExt, $movement['seed_id']);
+
+					if (!$seedInfoDeleteResult['success']) {
+						logAllocateError($local, $movement['log_id'], 'Failed to delete seed_info on source: ' . $seedInfoDeleteResult['error']);
+					}
+
+					// use the destination's seed_id
+					$destinationSeedId = (int) $seedInfoInsertResult['seed_id'];
+
+					// handle seed proxy
+					$sourceSeedProxy = getSeedProxyById($sourceExt, $movement['seed_id']);
+
+					if ($sourceSeedProxy !== null) {
+						$seedProxyInsertResult = insertSeedProxyToDestination($destinationExt, $sourceSeedProxy, $destinationSeedId);
+
+						if (!$seedProxyInsertResult['success']) {
+							logAllocateError($local, $movement['log_id'], 'Failed to insert seed_proxy on destination: ' . $seedProxyInsertResult['error']);
+						} else {
+							$seedProxyDeleteResult = deleteSeedProxyFromSource($sourceExt, $movement['seed_id']);
+
+							if (!$seedProxyDeleteResult['success']) {
+								logAllocateError($local, $movement['log_id'], 'Failed to delete seed_proxy on source: ' . $seedProxyDeleteResult['error']);
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// udpate seed allocate
-		$allocateResult = updateSeedAllocate($ext, (int) $movement['seed_id'], (int) $movement['from_list_id'], (int) $movement['to_list_id']);
+		$allocateResult = updateSeedAllocate($sourceExt, $destinationExt, (int) $movement['seed_id'], $destinationSeedId, (int) $movement['from_list_id'], (int) $movement['to_list_id']);
 
 		if (!$allocateResult['success']) {
 			logAllocateError($local, $movement['log_id'], $allocateResult['error']);
@@ -573,6 +675,7 @@ function canSeedRotateToDomain($local, $jobId, $section, $seedEmail, $server, $d
 				OR
 				(l.to_server = '$serverEsc' AND l.to_domain = '$destinationDomainEsc')
 			)
+			AND l.completed_datetime > DATE_SUB(NOW(), INTERVAL 70 DAY)
 			LIMIT 1";
 	$visitedRes = $local->query($sqlVisited);
 
@@ -670,31 +773,29 @@ function updateNextRotationSchedule($local, $jobId, $currentSection) {
 	return ['next_section' => $nextSection];
 }
 
-function updateSeedAllocate($ext, $seedId, $fromListId, $toListId) {
+function updateSeedAllocate($sourceExt, $destinationExt, $sourceSeedId, $destinationSeedId, $fromListId, $toListId) {
 	// check existing seed_allocate, do delete and insert (in case seed_id is already found with list_id)
-	$sqlExisting = "SELECT check_type FROM seed_allocate WHERE seed_id = $seedId AND list_id = $fromListId LIMIT 1";
-	$resExisting = $ext->query($sqlExisting);
+	$sqlExisting = "SELECT check_type FROM seed_allocate WHERE seed_id = $sourceSeedId AND list_id = $fromListId LIMIT 1";
+	$resExisting = $sourceExt->query($sqlExisting);
 
 	if ($resExisting && $resExisting->num_rows > 0) {
 		$checkType = $resExisting->fetch_assoc()['check_type'];
 
-		$sqlDelete = "DELETE FROM seed_allocate WHERE seed_id = $seedId AND list_id = $fromListId";
-		if (!$ext->query($sqlDelete)) {
-			return ['success' => false, 'error' => "Failed to delete seed_allocate row for seed_id=$seedId, list_id=$fromListId: " . $ext->error];
+		$sqlDelete = "DELETE FROM seed_allocate WHERE seed_id = $sourceSeedId AND list_id = $fromListId";
+		if (!$sourceExt->query($sqlDelete)) {
+			return ['success' => false, 'error' => "Failed to delete seed_allocate row for seed_id=$sourceSeedId, list_id=$fromListId: " . $sourceExt->error];
 		}
-		// echo "Delete seed_allocate for seed_id=$seedId, list_id=$fromListId\n";
 	} else {
 		$checkType = 'both';
 	}
 
 	$sqlUpsert = "INSERT INTO seed_allocate (seed_id, list_id, check_type)
-			VALUES ($seedId, $toListId, '$checkType')
+			VALUES ($destinationSeedId, $toListId, '$checkType')
 			ON DUPLICATE KEY UPDATE check_type = VALUES(check_type)";
 
-	if (!$ext->query($sqlUpsert)) {
-		return ['success' => false, 'error' => "Failed to upsert seed_allocate row for seed_id=$seedId, list_id=$toListId: " . $ext->error];
+	if (!$destinationExt->query($sqlUpsert)) {
+		return ['success' => false, 'error' => "Failed to upsert seed_allocate row for seed_id=$destinationSeedId, list_id=$toListId: " . $destinationExt->error];
 	}
-	// echo "Insert seed_allocate for seed_id=$seedId, list_id=$toListId\n";
 
 	return ['success' => true, 'error' => null];
 }
@@ -779,36 +880,51 @@ function processJob(array $job) {
 	require __DIR__ . '/../connection2.php';
 
 	$jobId = $job['job_id'];
-	$server = $job['pigeon_mail'];
+	$groupJob = $job['group_name'];
 	$section = $job['next_section'];
 
 	$startTimestamp = time();
 	$startDateTime = date('Y-m-d H:i:s', $startTimestamp);
 	$executionDate = date('Y-m-d', $startTimestamp);
-	$prevDate = date('Y-m-d', strtotime('-1 day', $startTimestamp));
+	// $prevDate = date('Y-m-d', strtotime('-1 day', $startTimestamp));
 	$today = date('Y-m-d');
 
 	$logData = [];
 
 	echo "Start: $startDateTime\n";
-	echo "Processing on server: $server\n";
+	echo "Processing on group job: $groupJob\n";
 
 	$runId = insertJobLog($conn, $jobId, $executionDate, $section, $startDateTime);
 
-	try {
-		$extConn = connectPigeonMail($server);
-	} catch (Exception $e) {
-		echo "Skipping server $server: " . $e->getMessage();
-		updateJobLog($conn, $runId, 'ERROR', $e->getMessage());
-		return;
+	// get the servers of the group
+	$serverList = getGroupServers($conn, $jobId);
+
+	$extConnections = [];
+	foreach ($serverList as $pigeonMail) {
+		try {
+			$extConnections[$pigeonMail] = connectPigeonMail($pigeonMail);
+		} catch (Exception $e) {
+			echo "Skipping group $groupJob: " . $e->getMessage();
+			updateJobLog($conn, $runId, 'ERROR', $e->getMessage());
+			foreach ($extConnections as $openConn) {
+				$openConn->close();
+			}
+			$conn->close();
+			return;
+		}
 	}
 
 	// check if any sending in progress
-	if (checkSending($extConn)) {
-		echo "Sending in progress on $server.\n";
-		updateJobLog($conn, $runId, 'SKIPPED', 'Sending in progress');
-		$extConn->close();
-		return;
+	foreach ($extConnections as $pigeonMail => $extConn) {
+		if (checkSending($extConn)) {
+			echo "Sending in progress on $pigeonMail.\n";
+			updateJobLog($conn, $runId, 'SKIPPED', 'Sending in progress on $pigeonMail');
+			foreach ($extConnections as $openConn) {
+				$openConn->close();
+			}
+			$conn->close();
+			return;
+		}
 	}
 
 	/* not required for now
@@ -837,16 +953,43 @@ function processJob(array $job) {
 
 	echo "Min notspam seed required for rotation: $minimumSeed\n"; */
 
-	// get scheduled train message group by head/tail
-	$result = getMessageGroupsBySection($extConn, $today, $section);
+	// get scheduled train message group by head/tail for each server
+	$messageGroupsByServer = [];
+	foreach ($extConnections as $pigeonMail => $extConn) {
+		$result = getMessageGroupsBySection($extConn, $today, $section);
 
-	if (count($result['message_groups']) == 0) {
-		$msg = "No train group message is scheduled on {$today}.";
-		echo "$msg\n";
-		updateJobLog($conn, $runId, 'SKIPPED', $msg);
-		$extConn->close();
-		return;
+		if (count($result['message_groups']) == 0) {
+			$msg = "No train group message is scheduled on {$today} for server $pigeonMail.";
+			echo "$msg\n";
+			updateJobLog($conn, $runId, 'SKIPPED', $msg);
+			foreach ($extConnections as $openConn) {
+				$openConn->close();
+			}
+			$conn->close();
+			return;
+		}
+
+		$messageGroupsByServer[$pigeonMail] = $result['message_groups'];
 	}
+
+	// check any new domain or domain replacement
+	foreach ($extConnections as $pigeonMail => $extConn) {
+		$syncResult = syncDomainSequence($conn, $extConn, $jobId, $pigeonMail, $messageGroupsByServer[$pigeonMail]);
+
+		echo $syncResult['message'] . "\n";
+
+		if (!$syncResult['success']) {
+			updateJobLog($conn, $runId, 'SKIPPED', $syncResult['message']);
+			foreach ($extConnections as $openConn) {
+				$openConn->close();
+			}
+			$conn->close();
+			return;
+		}
+	}
+
+	// get all domain from one or multiple server
+	$serverDomain = getGroupDomain($conn, $jobId, $serverList);
 
 	// get total seed by head/tail
 	// $seedResult = getTotalSeedByMessageGroups($extConn, $result['message_groups']);
@@ -861,13 +1004,13 @@ function processJob(array $job) {
 	// print_r($logData);
 
 	// build the plan insert to log table with 'PLANNED'
-	$planResult = buildAndSaveRotationPlan($conn, $extConn, $jobId, $section, $server, $runId, $result['message_groups']);
+	$planResult = buildAndSaveRotationPlan($conn, $extConnections, $jobId, $section, $runId, $messageGroupsByServer, $serverDomain);
 
 	// planned
 	// $logData['total_seed_rotated'][] = $planResult['planned'];
 
 	// start seed rotation
-	$rotationResult = executePlannedRotation($conn, $extConn, $runId);
+	$rotationResult = executePlannedRotation($conn, $extConnections, $runId);
 
 	$summary = "Planned: {$planResult['planned']}. "
 		. "Completed: {$rotationResult['completed']}. "
@@ -886,9 +1029,332 @@ function processJob(array $job) {
 	echo "Next rotation section: ({$nextSchedule['next_section']})\n";
 
 	// sort email id
-	sortTableIdByGroup($extConn, $result['message_groups']);
+	foreach ($extConnections as $pigeonMail => $extConn) {
+		sortTableIdByGroup($extConn, $messageGroupsByServer[$pigeonMail]);
+	}
 
-	$extConn->close();
+	foreach ($extConnections as $extConn) {
+		$extConn->close();
+	}
 	$conn->close();
+}
+
+function checkDomainRotate(array $domains, array $totalCounts, array $eligibleCounts) {
+	$domainCount = count($domains);
+	$domainIds = array_map(function($d) { return $d['pigeon_mail'] . '|' . $d['domain_name']; }, $domains);
+
+	$send = [];
+	$fullyEligible = [];
+
+	foreach ($domainIds as $idx => $domainId) {
+		$total = isset($totalCounts[$domainId]) ? $totalCounts[$domainId] : 0;
+		$eligible = isset($eligibleCounts[$domainId]) ? $eligibleCounts[$domainId] : 0;
+
+
+		$send[$domainId] = ($eligible > 0); // eligible rotation seed for destination domain based on log (allow partial, eligible could be lesser than total)
+		$fullyEligible[$domainId] = ($total > 0 && $eligible === $total); // source seed vs destination seed
+	}
+
+	// keep scanning until nothing changes
+	for ($pass = 0; $pass < $domainCount; $pass++) {
+		$changed = false;
+
+		for ($i = 0; $i < $domainCount; $i++) {
+			$domainId = $domainIds[$i];
+			$predecessorId = $domainIds[($i - 1 + $domainCount) % $domainCount];
+
+			// to check current domain able to rotate seed out, predecessor domain also have to be able to rotate seed out to current domain
+			if ($fullyEligible[$domainId] && $send[$domainId] && !$send[$predecessorId]) {
+				$send[$domainId] = false;
+				$changed = true;
+			}
+		}
+
+		if (!$changed) {
+			break;
+		}
+	}
+
+	return $send;
+}
+
+function getGroupServers($local, $jobId) {
+	$jobId = (int) $jobId;
+
+	$sql = "SELECT pigeon_mail
+			FROM seed_rotation_job_server
+			WHERE job_id = $jobId AND is_active = '1'
+			ORDER BY id ASC";
+	$res = $local->query($sql);
+
+	$servers = [];
+	while ($row = $res->fetch_assoc()) {
+		$servers[] = $row['pigeon_mail'];
+	}
+
+	return $servers;
+}
+
+function syncDomainSequence($local, $ext, $jobId, $pigeonMail, array $messageGroups) {
+	$jobId = (int) $jobId;
+	$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+
+	// live domains currently set to sending on this server for these message groups
+	$liveDomains = getRotationDomainsAndLists($ext, $messageGroups);
+	$liveDomainNames = array_map(function($d) { return $d['domain_name']; }, $liveDomains);
+
+	// get sending domain recorded in sequence table for this server
+	$sql = "SELECT domain_name, domain_position
+			FROM seed_rotation_domain_sequence
+			WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND is_active = '1'
+			ORDER BY domain_position ASC";
+	$res = $local->query($sql);
+
+	$recordedDomains = [];
+	while ($row = $res->fetch_assoc()) {
+		$recordedDomains[] = $row['domain_name'];
+	}
+
+	$missing = array_values(array_diff($recordedDomains, $liveDomainNames));
+	$new = array_values(array_diff($liveDomainNames, $recordedDomains));
+
+	// first time: record all live domains to seed_rotation_domain_sequence
+	if (empty($recordedDomains)) {
+		$position = 1;
+		foreach ($liveDomainNames as $domainName) {
+			insertDomainSequence($local, $jobId, $pigeonMail, $domainName, $position);
+			$position++;
+		}
+
+		return ['success' => true, 'message' => "Inserted " . count($liveDomainNames) . " domain(s) for $pigeonMail."];
+	}
+
+	// in case domain count is mismatch
+	/* if (count($missing) !== count($new)) {
+		return [
+			'success' => false,
+			'message' => "Domain count mismatch on server $pigeonMail: " . count($missing) . " missing, " . count($new) . " new."
+		];
+	} */
+
+	// no domain changes this round
+	if (empty($missing) && empty($new)) {
+		return ['success' => true, 'message' => "No domain change detected for $pigeonMail."];
+	}
+
+	// 3 scenario of domain: missing = new, missing > new, missing < new (new domain inherits missing domain's position)
+	$totalDomain = min(count($missing), count($new));
+
+	for ($i = 0; $i < $totalDomain; $i++) {
+		$missingDomain = $missing[$i];
+		$newDomain = $new[$i];
+
+		$position = getDomainSequencePosition($local, $jobId, $pigeonMail, $missingDomain);
+
+		// after replace the dead domain, set to is_active=0
+		retireDomainSequence($local, $jobId, $pigeonMail, $missingDomain);
+
+		// insert the new replacement domain
+		insertDomainSequence($local, $jobId, $pigeonMail, $newDomain, $position);
+	}
+
+	// new > missing: leftover new domain(s) get appended to the end of this server's own block
+	if (count($new) > $totalDomain) {
+		$nextPosition = getMaxDomainPosition($local, $jobId, $pigeonMail) + 1;
+
+		for ($i = $totalDomain; $i < count($new); $i++) {
+			echo $nextPosition . " | " . $new[$i] . "\n";
+			insertDomainSequence($local, $jobId, $pigeonMail, $new[$i], $nextPosition);
+			$nextPosition++;
+		}
+	}
+
+	// missing > new: leftover missing domain(s) just retire, no replacement inserted
+	if (count($missing) > $totalDomain) {
+		for ($i = $totalDomain; $i < count($missing); $i++) {
+			retireDomainSequence($local, $jobId, $pigeonMail, $missing[$i]);
+		}
+	}
+
+	return ['success' => true, 'message' => count($new) . " new domain(s), " . count($missing) . " retired domain(s) applied for $pigeonMail."];
+}
+
+function getDomainSequencePosition($local, $jobId, $pigeonMail, $domainName) {
+	$jobId = (int) $jobId;
+	$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+	$domainNameEsc = $local->real_escape_string($domainName);
+
+	$sql = "SELECT domain_position
+			FROM seed_rotation_domain_sequence
+			WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND domain_name = '$domainNameEsc' AND is_active = '1'
+			LIMIT 1";
+	$res = $local->query($sql);
+	$row = $res->fetch_assoc();
+
+	return (int) $row['domain_position'];
+}
+
+function getMaxDomainPosition($local, $jobId, $pigeonMail) {
+	$jobId = (int) $jobId;
+	$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+
+	$sql = "SELECT MAX(domain_position) AS max_position
+			FROM seed_rotation_domain_sequence
+			WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND is_active = '1'";
+	$res = $local->query($sql);
+	$row = $res->fetch_assoc();
+
+	return $row['max_position'] !== null ? (int) $row['max_position'] : 0;
+}
+
+function insertDomainSequence($local, $jobId, $pigeonMail, $domainName, $position) {
+	$jobId = (int) $jobId;
+	$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+	$domainNameEsc = $local->real_escape_string($domainName);
+	$position = (int) $position;
+
+	// if domain is retired before, activate back
+	$sqlExisting = "SELECT id
+			FROM seed_rotation_domain_sequence
+			WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND domain_name = '$domainNameEsc' AND is_active = '0'
+			LIMIT 1";
+	$resExisting = $local->query($sqlExisting);
+
+	if ($resExisting && $resExisting->num_rows > 0) {
+		$sql = "UPDATE seed_rotation_domain_sequence
+				SET is_active = '1', domain_position = $position
+				WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND domain_name = '$domainNameEsc' AND is_active = '0'";
+
+		return $local->query($sql);
+	}
+
+	$sql = "INSERT INTO seed_rotation_domain_sequence (job_id, pigeon_mail, domain_name, domain_position, is_active)
+			VALUES ($jobId, '$pigeonMailEsc', '$domainNameEsc', $position, '1')";
+
+	return $local->query($sql);
+}
+
+function retireDomainSequence($local, $jobId, $pigeonMail, $domainName) {
+	$jobId = (int) $jobId;
+	$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+	$domainNameEsc = $local->real_escape_string($domainName);
+
+	$sql = "UPDATE seed_rotation_domain_sequence 
+			SET is_active = '0', updated_datetime = current_timestamp
+			WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND domain_name = '$domainNameEsc' AND is_active = '1'";
+
+	return $local->query($sql);
+}
+
+function getGroupDomain($local, $jobId, array $serverOrder) {
+	$jobId = (int) $jobId;
+
+	$serverDomain = [];
+	foreach ($serverOrder as $pigeonMail) {
+		$pigeonMailEsc = $local->real_escape_string($pigeonMail);
+
+		$sql = "SELECT pigeon_mail, domain_name, domain_position
+				FROM seed_rotation_domain_sequence
+				WHERE job_id = $jobId AND pigeon_mail = '$pigeonMailEsc' AND is_active = '1'
+				ORDER BY domain_position ASC";
+		$res = $local->query($sql);
+
+		while ($row = $res->fetch_assoc()) {
+			$serverDomain[] = [
+				'pigeon_mail' => $row['pigeon_mail'],
+				'domain_name' => $row['domain_name'],
+			];
+		}
+	}
+
+	return $serverDomain;
+}
+
+function getSeedInfoById($ext, $seedId) {
+	$seedId = (int) $seedId;
+
+	$sql = "SELECT seed_email, seed_pass, seed_domain, seed_status, seed_statdate, seed_server, seed_remark
+			FROM seed_info
+			WHERE seed_id = $seedId
+			LIMIT 1";
+	$res = $ext->query($sql);
+
+	return $res ? $res->fetch_assoc() : null;
+}
+
+function insertSeedInfoToDestination($destinationExt, array $sourceSeedInfo, $destinationPigeonMail) {
+	$emailEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_email']);
+	$passEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_pass']);
+	$domainEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_domain']);
+	$statusEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_status']);
+	$statdateEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_statdate']);
+	$remarkEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_remark']);
+	$serverEsc = $destinationExt->real_escape_string($sourceSeedInfo['seed_server']);
+
+	$sql = "INSERT INTO seed_info (seed_email, seed_pass, seed_domain, seed_status, seed_statdate, seed_server, seed_remark)
+			VALUES ('$emailEsc', '$passEsc', '$domainEsc', '$statusEsc', '$statdateEsc', '$serverEsc', '$remarkEsc')
+			ON DUPLICATE KEY UPDATE seed_id = LAST_INSERT_ID(seed_id)";
+
+	if (!$destinationExt->query($sql)) {
+		return ['success' => false, 'error' => $destinationExt->error];
+	}
+
+	return ['success' => true, 'seed_id' => $destinationExt->insert_id];
+}
+
+function deleteSeedInfoFromSource($sourceExt, $sourceSeedId) {
+	$sourceSeedId = (int) $sourceSeedId;
+
+	$sql = "DELETE FROM seed_info WHERE seed_id = $sourceSeedId";
+
+	if (!$sourceExt->query($sql)) {
+		return ['success' => false, 'error' => $sourceExt->error];
+	}
+
+	return ['success' => true];
+}
+
+function getSeedProxyById($ext, $seedId) {
+	$seedId = (int) $seedId;
+
+	$sql = "SELECT proxy_type, proxy_value
+			FROM seed_proxy
+			WHERE seed_id = $seedId
+			LIMIT 1";
+	$res = $ext->query($sql);
+
+	if (!$res || $res->num_rows === 0) {
+		return null; // in case no proxy found for seed
+	}
+
+	return $res->fetch_assoc();
+}
+
+function insertSeedProxyToDestination($destinationExt, array $sourceSeedProxy, $destinationSeedId) {
+	$destinationSeedId = (int) $destinationSeedId;
+	$proxyTypeEsc = $destinationExt->real_escape_string($sourceSeedProxy['proxy_type']);
+	$proxyValueEsc = $destinationExt->real_escape_string($sourceSeedProxy['proxy_value']);
+
+	$sql = "INSERT INTO seed_proxy (seed_id, proxy_type, proxy_value)
+			VALUES ($destinationSeedId, '$proxyTypeEsc', '$proxyValueEsc')
+			ON DUPLICATE KEY UPDATE proxy_type = VALUES(proxy_type), proxy_value = VALUES(proxy_value)";
+
+	if (!$destinationExt->query($sql)) {
+		return ['success' => false, 'error' => $destinationExt->error];
+	}
+
+	return ['success' => true];
+}
+
+function deleteSeedProxyFromSource($sourceExt, $sourceSeedId) {
+	$sourceSeedId = (int) $sourceSeedId;
+
+	$sql = "DELETE FROM seed_proxy WHERE seed_id = $sourceSeedId";
+
+	if (!$sourceExt->query($sql)) {
+		return ['success' => false, 'error' => $sourceExt->error];
+	}
+
+	return ['success' => true];
 }
 ?>
